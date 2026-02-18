@@ -7,7 +7,11 @@ import { applyUpdates } from "@/lib/ai/session-manager";
 import type { Project } from "@/lib/types/session";
 
 export async function POST(req: Request) {
-  const { messages, projectId } = await req.json();
+  try {
+  const body = await req.json();
+  const { messages, projectId } = body;
+  console.log("[chat] Request received, projectId:", projectId, "messages count:", messages?.length);
+
   const supabase = await createClient();
 
   // 인증 확인
@@ -15,8 +19,10 @@ export async function POST(req: Request) {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) {
+    console.log("[chat] Unauthorized - no user");
     return new Response("Unauthorized", { status: 401 });
   }
+  console.log("[chat] Authenticated user:", user.id);
 
   // 프로젝트 로드
   const { data: project, error: projectError } = await supabase
@@ -26,6 +32,7 @@ export async function POST(req: Request) {
     .single();
 
   if (projectError || !project) {
+    console.log("[chat] Project not found:", projectError?.message);
     return new Response("Project not found", { status: 404 });
   }
 
@@ -66,11 +73,19 @@ export async function POST(req: Request) {
     isNewProject
   );
 
+  // UIMessage → CoreMessage 변환
+  const coreMessages = messages.map((m: { role: string; content?: string; parts?: Array<{ type: string; text?: string }> }) => ({
+    role: m.role,
+    content: m.content || m.parts?.filter((p: { type: string }) => p.type === "text").map((p: { text?: string }) => p.text).join("") || "",
+  }));
+
+  console.log("[chat] Calling Claude, phase:", typedProject.current_phase, "coreMessages:", coreMessages.length);
+
   // Claude 스트리밍 호출
   const result = streamText({
     model: anthropic("claude-sonnet-4-20250514"),
     system: systemPrompt,
-    messages,
+    messages: coreMessages,
     maxOutputTokens: 4096,
     onFinish: async ({ text }) => {
       // 응답 파싱 및 DB 업데이트
@@ -95,10 +110,11 @@ export async function POST(req: Request) {
       // 사용자 메시지 저장 (마지막 메시지가 user인 경우)
       const lastMsg = messages[messages.length - 1];
       if (lastMsg?.role === "user") {
+        const userContent = lastMsg.content || lastMsg.parts?.filter((p: { type: string }) => p.type === "text").map((p: { text?: string }) => p.text).join("") || "";
         await supabase.from("messages").insert({
           project_id: projectId,
           role: "user",
-          content: lastMsg.content,
+          content: userContent,
           phase: typedProject.current_phase,
         });
       }
@@ -106,4 +122,8 @@ export async function POST(req: Request) {
   });
 
   return result.toTextStreamResponse();
+  } catch (error) {
+    console.error("[chat] Error:", error);
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
+  }
 }
